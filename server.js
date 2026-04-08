@@ -1,65 +1,211 @@
-import express from "express";
-import http from "http";
-import { Server } from "socket.io";
-import cors from "cors";
+// server.js
+// Simple WebSocket game server for "The Runner"
 
-const app = express();
-app.use(cors());
+const http = require("http");
+const WebSocket = require("ws");
 
-const server = http.createServer(app);
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
 
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
+/**
+ * In-memory game state
+ * games = {
+ *   CODE: {
+ *     players: Set<ws>,
+ *     roles: Map<ws, "runner" | "chaser" | "pending">,
+ *     lastRunnerLocation: { lat, lng } | null,
+ *     lastChaserLocation: { lat, lng } | null,
+ *     waypointSelected: boolean
+ *   }
+ * }
+ */
+const games = {};
+
+function getOrCreateGame(code) {
+  if (!games[code]) {
+    games[code] = {
+      players: new Set(),
+      roles: new Map(),
+      lastRunnerLocation: null,
+      lastChaserLocation: null,
+      waypointSelected: false,
+    };
   }
+  return games[code];
+}
+
+function removePlayerFromGames(ws) {
+  for (const [code, game] of Object.entries(games)) {
+    if (game.players.has(ws)) {
+      game.players.delete(ws);
+      game.roles.delete(ws);
+
+      if (game.players.size === 0) {
+        delete games[code];
+      }
+    }
+  }
+}
+
+function broadcastToGame(code, data) {
+  const game = games[code];
+  if (!game) return;
+
+  const message = JSON.stringify(data);
+
+  for (const player of game.players) {
+    if (player.readyState === WebSocket.OPEN) {
+      player.send(message);
+    }
+  }
+}
+
+function parseMessage(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error("Invalid JSON:", raw);
+    return null;
+  }
+}
+
+wss.on("connection", (ws) => {
+  console.log("Client connected");
+
+  ws.on("message", (raw) => {
+    const msg = parseMessage(raw);
+    if (!msg || !msg.type) return;
+
+    console.log("Received:", msg);
+
+    switch (msg.type) {
+      case "JOIN_GAME": {
+        const code = String(msg.payload || "").toUpperCase();
+        if (!code) return;
+
+        const game = getOrCreateGame(code);
+        game.players.add(ws);
+        game.roles.set(ws, "pending");
+
+        ws.gameCode = code;
+
+        ws.send(
+          JSON.stringify({
+            type: "JOINED_GAME",
+            payload: { code },
+          })
+        );
+        break;
+      }
+
+      case "SET_ROLE": {
+        // payload: {"code":"ABCD","role":"runner"|"chaser"}
+        let payload;
+        try {
+          payload = JSON.parse(msg.payload);
+        } catch {
+          return;
+        }
+        const code = String(payload.code || "").toUpperCase();
+        const role = payload.role;
+
+        if (!code || !role) return;
+        const game = getOrCreateGame(code);
+
+        if (!game.players.has(ws)) {
+          game.players.add(ws);
+        }
+        game.roles.set(ws, role);
+        ws.gameCode = code;
+
+        ws.send(
+          JSON.stringify({
+            type: "ROLE_SET",
+            payload: { code, role },
+          })
+        );
+        break;
+      }
+
+      case "RUNNER_LOCATION": {
+        const code = ws.gameCode;
+        if (!code || !games[code]) return;
+
+        const { lat, lng } = msg;
+        games[code].lastRunnerLocation = { lat, lng };
+
+        broadcastToGame(code, {
+          type: "RUNNER_LOCATION",
+          lat,
+          lng,
+        });
+        break;
+      }
+
+      case "CHASER_LOCATION": {
+        const code = ws.gameCode;
+        if (!code || !games[code]) return;
+
+        const { lat, lng } = msg;
+        games[code].lastChaserLocation = { lat, lng };
+
+        broadcastToGame(code, {
+          type: "CHASER_LOCATION",
+          lat,
+          lng,
+        });
+        break;
+      }
+
+      case "WAYPOINT_1_SELECTED": {
+        const code = ws.gameCode;
+        if (!code || !games[code]) return;
+
+        games[code].waypointSelected = true;
+
+        broadcastToGame(code, {
+          type: "WAYPOINT_1_SELECTED",
+        });
+        break;
+      }
+
+      case "RUNNER_CAPTURED": {
+        const code = ws.gameCode;
+        if (!code || !games[code]) return;
+
+        broadcastToGame(code, {
+          type: "RUNNER_CAPTURED",
+        });
+        break;
+      }
+
+      case "RUNNER_WIN": {
+        const code = ws.gameCode;
+        if (!code || !games[code]) return;
+
+        broadcastToGame(code, {
+          type: "RUNNER_WIN",
+        });
+        break;
+      }
+
+      default:
+        console.log("Unknown message type:", msg.type);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("Client disconnected");
+    removePlayerFromGames(ws);
+  });
+
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err);
+    removePlayerFromGames(ws);
+  });
 });
 
-// Store game rooms by code
-const games = {}; 
-// games[code] = { runnerSocketId, chasers: Set(socketIds) }
-
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
-
-  // Player joins a game code
-  socket.on("join_game", ({ code, role }) => {
-    if (!games[code]) {
-      games[code] = { runnerSocketId: null, chasers: new Set() };
-    }
-
-    if (role === "runner") {
-      games[code].runnerSocketId = socket.id;
-    } else if (role === "chaser") {
-      games[code].chasers.add(socket.id);
-    }
-
-    socket.join(code);
-    console.log(`Socket ${socket.id} joined game ${code} as ${role}`);
-  });
-
-  // Runner sends location update
-  socket.on("runner_location_update", ({ code, lat, lng }) => {
-    io.to(code).emit("runner_location_update", { lat, lng });
-  });
-
-  // Server tells chasers the runner was captured
-  socket.on("runner_captured", ({ code }) => {
-    io.to(code).emit("runner_captured");
-  });
-
-  // Server tells chasers the runner finished all waypoints
-  socket.on("runner_finished_waypoints", ({ code }) => {
-    io.to(code).emit("runner_finished_waypoints");
-  });
-
-  socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
-  });
-});
-
-// Render uses PORT environment variable
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+  console.log(`WebSocket server listening on port ${PORT}`);
 });
